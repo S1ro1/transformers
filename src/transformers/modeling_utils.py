@@ -99,6 +99,7 @@ from .utils import (
     WEIGHTS_NAME,
     ContextManagers,
     PushToHubMixin,
+    SafetensorsReader,
     cached_file,
     check_torch_load_is_safe,
     copy_func,
@@ -981,6 +982,44 @@ def load_shard_files_with_threadpool(args_list):
                 pbar.update(1)
 
     return error_msgs, disk_offload_index, cpu_offload_index
+
+
+def _load_dcp_model(shard_files, state_dict, key_renaming_mapping, model_to_load, expected_keys, device_mesh):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+    from torch.distributed.tensor import DTensor, Replicate
+
+    from .integrations.tensor_parallel2 import prepare_tp_model
+
+    prepare_tp_model(model_to_load, device_mesh)
+
+    state_dict = model_to_load.state_dict()
+    state_dict = {key_renaming_mapping[k]: v for k, v in state_dict.items() if k in key_renaming_mapping}
+
+    dcp.load(
+        state_dict,
+        storage_reader=SafetensorsReader(
+            os.path.dirname(shard_files[0])
+        ),  # TODO: Siro - fix multiple folders (can that even happen?)
+    )
+
+    model_to_load.to_empty(device="cuda")
+
+    sdo = StateDictOptions(strict=False)
+
+    unexpected_keys = set_model_state_dict(model_to_load, state_dict, options=sdo)
+
+    # TODO: proper weight tying support, this is very ugly
+    if unexpected_keys and "lm_head.weight" in unexpected_keys.missing_keys:
+        unexpected_keys.missing_keys.remove("lm_head.weight")
+        embed_weight = model_to_load.model.embed_tokens.weight
+        if not isinstance(embed_weight, DTensor):
+            model_weight = DTensor.from_local(embed_weight, device_mesh=device_mesh, placements=[Replicate()])
+        else:
+            model_weight = embed_weight
+        model_to_load.lm_head.weight = torch.nn.Parameter(model_weight)
+
+    return model_to_load, [], None, None
 
 
 def _add_variant(weights_name: str, variant: Optional[str] = None) -> str:
@@ -4956,7 +4995,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             # Let's make sure we don't run the init function of buffer modules
             model = cls(config, *model_args, **model_kwargs)
 
-        if _torch_distributed_available and device_mesh is not None:
+        if _torch_distributed_available and device_mesh is not None and False:
             model = distribute_model(model, distributed_config, device_mesh, tp_size)
 
         # Make sure to tie the weights correctly
@@ -5043,7 +5082,9 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 weights_only=weights_only,
             )
         # make sure token embedding weights are still tied if needed
-        model.tie_weights()
+        # TODO: Siro - tie weights should support dtensors properly
+        if device_mesh is None:
+            model.tie_weights()
 
         # Set model in evaluation mode to deactivate DropOut modules by default
         model.eval()
@@ -5470,9 +5511,19 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             for shard_file in checkpoint_files
         ]
 
+        fixed_args_list = [checkpoint_files] + [
+            state_dict,
+            key_renaming_mapping,
+            model_to_load,
+            expected_keys,
+            device_mesh,
+        ]
+
         error_msgs = []
 
-        if (
+        if device_mesh is not None:
+            model_to_load, _error_msgs, disk_offload_index, cpu_offload_index = _load_dcp_model(*fixed_args_list)
+        elif (
             os.environ.get("HF_ENABLE_PARALLEL_LOADING", "").upper() in ENV_VARS_TRUE_VALUES
             and not is_deepspeed_zero3_enabled()
         ):
@@ -5512,7 +5563,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             missing_keys = hf_quantizer.update_missing_keys_after_loading(model_to_load, missing_keys, prefix)
 
         # Post-processing for tensor parallelism
-        if device_mesh is not None:
+        if device_mesh is not None and False:
             # When using TP, the device map is a single device for all parameters
             tp_device = list(device_map.values())[0]
             # This is needed for the RotaryEmbedding, which was not initialized on the correct device as it is

@@ -98,8 +98,8 @@ def main():
             f"World size ({world_size}) must equal TP size ({tp_size}) * DP size ({dp_size}) * CP size ({cp_size})"
         )
 
-        mesh = torch.arange(world_size).reshape(dp_size, tp_size, cp_size)
-        world_mesh = DeviceMesh(device_type="cuda", mesh=mesh, mesh_dim_names=("dp", "tp", "cp"))
+        mesh = torch.arange(world_size).reshape(dp_size, cp_size, tp_size)
+        world_mesh = DeviceMesh(device_type="cuda", mesh=mesh, mesh_dim_names=("dp", "cp", "tp"))
         tp_mesh = world_mesh["tp"]
         dp_mesh = world_mesh["dp"]
         cp_mesh = world_mesh["cp"]
@@ -141,7 +141,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_mesh=tp_mesh if dist.is_initialized() else None,
-        tp_plan="auto",
+        tp_plan="auto" if dist.is_initialized() else None,
         torch_dtype=torch.bfloat16,
     )
     logger.info(f"Model loaded onto device mesh: {tp_mesh}")
@@ -161,7 +161,11 @@ def main():
     def tokenize_function(examples):
         # Tokenize the text without padding
         tokenized_batch = tokenizer(
-            examples["text"], padding=False, truncation=True, max_length=seq_len, return_tensors=None
+            examples["text"],
+            padding=False,
+            truncation=True,
+            max_length=seq_len,
+            return_tensors=None,
         )
         # Set labels to be the same as input_ids for Causal LM
         tokenized_batch["labels"] = tokenized_batch["input_ids"].copy()
@@ -229,7 +233,10 @@ def main():
 
     if dist.is_initialized():
         sampler = DistributedSampler(
-            packed_dataset, num_replicas=dp_mesh.size(), rank=dp_mesh.get_local_rank(), shuffle=False
+            packed_dataset,
+            num_replicas=dp_mesh.size(),
+            rank=dp_mesh.get_local_rank(),
+            shuffle=False,
         )
     else:
         sampler = None
@@ -291,7 +298,10 @@ def main():
 
                     # Compute loss with shifted labels
                     loss = model.loss_function(
-                        logits=logits, labels=None, shift_labels=labels, vocab_size=model.config.vocab_size
+                        logits=logits,
+                        labels=None,
+                        shift_labels=labels,
+                        vocab_size=model.config.vocab_size,
                     )
                     loss.backward()
 
@@ -305,10 +315,17 @@ def main():
                     assert len(list(model.parameters())) > 5, "No parameters found in model. Probably DDP bug.."
                     gradnorm = clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=2.0, foreach=True)
 
-                optimizer.step()
+                from torch.distributed.tensor.experimental import implicit_replication
+
+                with implicit_replication():
+                    optimizer.step()
                 # allreduce loss across cp_dp before logging
                 if dist.is_initialized() and (cp_mesh.size() > 1 or dp_mesh.size() > 1):
-                    dist.all_reduce(loss, group=world_mesh["dp_cp"].get_group(), op=dist.ReduceOp.AVG)
+                    dist.all_reduce(
+                        loss,
+                        group=world_mesh["dp_cp"].get_group(),
+                        op=dist.ReduceOp.AVG,
+                    )
                 current_loss = loss.item()
 
                 # Log loss and gradnorm to wandb (only on rank 0 of dp group)
@@ -369,16 +386,26 @@ def all_reduce_grads(model, world_mesh, use_ddp):
                     local_grad = param.grad.to_local()
                     # Ensure grad requires grad for inplace modification checks (might not be needed)
                     # local_grad = local_grad.detach().requires_grad_(True)
-                    torch.distributed.all_reduce(local_grad, op=torch.distributed.ReduceOp.SUM, group=mesh.get_group())
+                    torch.distributed.all_reduce(
+                        local_grad,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=mesh.get_group(),
+                    )
                     local_grad = local_grad / mesh.size()
                     # Assign averaged grad back - need careful handling if DTensor structure is complex
                     # This simple assignment might work if the grad structure matches param structure
                     param.grad = DTensor.from_local(
-                        local_grad, device_mesh=param.grad.device_mesh, placements=param.grad.placements
+                        local_grad,
+                        device_mesh=param.grad.device_mesh,
+                        placements=param.grad.placements,
                     )
                 else:
                     # Handle regular tensors if any exist (e.g. buffers not converted to DTensor)
-                    torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG, group=mesh.get_group())
+                    torch.distributed.all_reduce(
+                        param.grad,
+                        op=torch.distributed.ReduceOp.AVG,
+                        group=mesh.get_group(),
+                    )
 
 
 class AppState(Stateful):
@@ -394,7 +421,10 @@ class AppState(Stateful):
 
     def load_state_dict(self, state_dict):
         set_state_dict(
-            self.model, self.optimizer, model_state_dict=state_dict["model"], optim_state_dict=state_dict["optim"]
+            self.model,
+            self.optimizer,
+            model_state_dict=state_dict["model"],
+            optim_state_dict=state_dict["optim"],
         )
 
 
@@ -416,7 +446,10 @@ def clip_grad_norm_(
     if norm_type == float("inf"):
         total_norm = max(p.grad.detach().abs().max() for p in parameters)
     else:
-        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type) for p in parameters]), norm_type)
+        total_norm = torch.norm(
+            torch.stack([torch.norm(p.grad.detach(), norm_type) for p in parameters]),
+            norm_type,
+        )
 
     # Convert DTensor to local tensor if needed
     if isinstance(total_norm, DTensor):

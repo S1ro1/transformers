@@ -283,6 +283,7 @@ from .peft_utils import (
     check_peft_version,
     find_adapter_config_file,
 )
+from .safetensors_storage_reader import SafetensorsReader
 
 
 WEIGHTS_NAME = "pytorch_model.bin"
