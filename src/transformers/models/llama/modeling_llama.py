@@ -406,8 +406,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
 @auto_docstring
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+
+    from torch.distributed.tensor import Replicate, Shard
+    from torch.distributed.tensor.parallel import ColwiseParallel
+
     _tied_weights_keys = ["lm_head.weight"]
-    _tp_plan = {"lm_head": "colwise_rep"}
+    _tp_plan = {"lm_head": ColwiseParallel(output_layouts=Replicate())}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):

@@ -989,7 +989,7 @@ def _load_dcp_model(shard_files, state_dict, key_renaming_mapping, model_to_load
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
     from torch.distributed.tensor import DTensor, Replicate
 
-    from .integrations.tensor_parallel2 import prepare_tp_model
+    from .integrations.tensor_parallel2 import fix_tied_weights, prepare_tp_model
 
     prepare_tp_model(model_to_load, device_mesh)
 
@@ -1009,15 +1009,17 @@ def _load_dcp_model(shard_files, state_dict, key_renaming_mapping, model_to_load
 
     unexpected_keys = set_model_state_dict(model_to_load, state_dict, options=sdo)
 
-    # TODO: proper weight tying support, this is very ugly
+    # TODO: proper weight tying support, is very ugly
     if unexpected_keys and "lm_head.weight" in unexpected_keys.missing_keys:
         unexpected_keys.missing_keys.remove("lm_head.weight")
         embed_weight = model_to_load.model.embed_tokens.weight
         if not isinstance(embed_weight, DTensor):
             model_weight = DTensor.from_local(embed_weight, device_mesh=device_mesh, placements=[Replicate()])
         else:
-            model_weight = embed_weight
+            model_weight = embed_weight.full_tensor()
+
         model_to_load.lm_head.weight = torch.nn.Parameter(model_weight)
+        model_to_load = fix_tied_weights(model_to_load, device_mesh)
 
     return model_to_load, [], None, None
 

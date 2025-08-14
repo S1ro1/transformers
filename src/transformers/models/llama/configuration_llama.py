@@ -143,14 +143,39 @@ class LlamaConfig(PretrainedConfig):
     model_type = "llama"
     keys_to_ignore_at_inference = ["past_key_values"]
     # Default tensor parallel plan for base model `LlamaModel`
+
+    from torch.distributed.tensor import Replicate, Shard
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        PrepareModuleInput,
+        RowwiseParallel,
+        SequenceParallel,
+    )
+
     base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
+        "model.embed_tokens": RowwiseParallel(
+            input_layouts=Replicate(), output_layouts=Shard(1)
+        ),  # we go out sharded on seq dim, going into 1st decoder
+        "layers.*.input_layernorm": SequenceParallel(),  # again we can go out sharded on seq dim, going into self-attn
+        "layers.*.self_attn": PrepareModuleInput(
+            input_kwarg_layouts={"hidden_states": Shard(1)},
+            desired_input_kwarg_layouts={"hidden_states": Replicate()},
+        ),  # all gather on seq dim
+        "layers.*.self_attn.q_proj": ColwiseParallel(), # we go out sharded on last dim
+        "layers.*.self_attn.k_proj": ColwiseParallel(),
+        "layers.*.self_attn.v_proj": ColwiseParallel(),
+        "layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),  # do reduce-scatter to be on seq-dim
+        "layers.*.post_attention_layernorm": SequenceParallel(),  # we go out sharded on seq dim, going into another MLP
+        "layers.*.mlp": PrepareModuleInput(
+            input_layouts=Shard(1), desired_input_layouts=Replicate()
+        ),  # all gather on seq dim
+        "layers.*.mlp.gate_proj": ColwiseParallel(),
+        "layers.*.mlp.up_proj": ColwiseParallel(),
+        "layers.*.mlp.down_proj": RowwiseParallel(
+            output_layouts=Shard(1)
+        ),  # do reduce-scatter to be on seq-dim shard going into norm again
+
+        "model.norm": SequenceParallel(),  # we go out sharded on seq dim
     }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
